@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,7 @@ from .geometry import (
     angular_distance,
     dial_radial_fraction,
     merge_ticks_by_angle,
+    needle_angle_at_tick_ring,
     normalize_angle,
     point_on_dial,
 )
@@ -81,8 +83,17 @@ class LocalCVPipeline:
             cv2.circle(image, _int_point(dial.center), 4, (80, 180, 255), -1)
 
         if observation.dial is not None and observation.needle is not None:
-            end = point_on_dial(observation.dial, observation.needle.angle, 0.9)
-            cv2.line(image, _int_point(observation.dial.center), _int_point(end), (0, 0, 255), 3)
+            dial = observation.dial
+            needle = observation.needle
+            pivot = needle.start if needle.start is not None else dial.center
+            if needle.end is not None:
+                tick_angle = needle_angle_at_tick_ring(dial, needle)
+                ring_point = point_on_dial(dial, tick_angle, 0.92)
+                cv2.line(image, _int_point(pivot), _int_point(needle.end), (0, 0, 180), 2)
+                cv2.line(image, _int_point(pivot), _int_point(ring_point), (0, 0, 255), 3)
+            else:
+                end = point_on_dial(dial, needle.angle, 0.92)
+                cv2.line(image, _int_point(dial.center), _int_point(end), (0, 0, 255), 3)
 
         for tick in observation.ticks:
             if observation.dial is not None:
@@ -107,6 +118,9 @@ class LocalCVPipeline:
                     continue
                 end = point_on_dial(observation.dial, angle, 1.0)
                 cv2.line(image, _int_point(observation.dial.center), _int_point(end), color, 2)
+
+        tick_count = len(observation.ticks)
+        print(f"cv_ticks_detected: {tick_count}", file=sys.stderr)
 
         output = debug_path / "overlay.jpg"
         cv2.imwrite(str(output), image)

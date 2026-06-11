@@ -12,12 +12,15 @@ from gauge_reader.geometry import (
     angle_from_point,
     angular_distance,
     dial_radial_fraction,
+    label_in_dial_ring,
+    minor_tick_spacing_degrees,
+    needle_angle_at_tick_ring,
     point_at_angle,
     point_on_dial,
     sweep_delta,
 )
-from gauge_reader.interpolation import interpolate_reading
-from gauge_reader.models import DialGeometry, Point, ValueTick
+from gauge_reader.interpolation import interpolate_reading, snap_tolerance_degrees
+from gauge_reader.models import DialGeometry, NeedleDetection, Point, TickDetection, ValueTick
 
 
 class GeometryTests(unittest.TestCase):
@@ -84,6 +87,50 @@ class InterpolationTests(unittest.TestCase):
     def test_returns_none_without_bracket(self) -> None:
         ticks = [ValueTick(value=0, angle=225, confidence=1.0)]
         self.assertIsNone(interpolate_reading(90, ticks))
+
+    def test_snaps_to_nearby_tick_before_interpolation(self) -> None:
+        ticks = [
+            ValueTick(value=4, angle=80, confidence=1.0),
+            ValueTick(value=5, angle=90, confidence=1.0),
+            ValueTick(value=6, angle=100, confidence=1.0),
+        ]
+        result = interpolate_reading(89.0, ticks, minor_tick_spacing=10.0)
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.reading, 5.0)
+        self.assertEqual(result.direction, "snap")
+
+    def test_snap_tolerance_uses_minor_tick_spacing(self) -> None:
+        self.assertAlmostEqual(snap_tolerance_degrees(20.0), 5.0)
+        self.assertAlmostEqual(snap_tolerance_degrees(4.0), 2.5)
+
+
+class NeedleTickRingTests(unittest.TestCase):
+    def test_needle_angle_uses_tick_ring_intersection(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        needle = NeedleDetection(
+            angle=90,
+            confidence=0.9,
+            start=Point(102, 103),
+            end=Point(100, 25),
+        )
+        angle = needle_angle_at_tick_ring(dial, needle)
+        self.assertAlmostEqual(angle, 90, places=1)
+
+    def test_label_ring_filter(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        inside = point_on_dial(dial, 45, 0.72)
+        outside = point_on_dial(dial, 45, 0.15)
+        self.assertTrue(label_in_dial_ring(dial, inside))
+        self.assertFalse(label_in_dial_ring(dial, outside))
+
+    def test_minor_tick_spacing_from_detected_ticks(self) -> None:
+        ticks = [
+            TickDetection(angle=0, confidence=1.0),
+            TickDetection(angle=10, confidence=1.0),
+            TickDetection(angle=20, confidence=1.0),
+        ]
+        self.assertAlmostEqual(minor_tick_spacing_degrees(ticks), 10.0)
 
 
 if __name__ == "__main__":

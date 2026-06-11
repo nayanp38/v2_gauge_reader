@@ -7,7 +7,14 @@ from typing import Any
 
 from .cloud import CloudVisionAdapter, default_cloud_adapter
 from .cv_pipeline import ImageReadError, LocalCVPipeline, MissingDependencyError
-from .geometry import angle_from_dial_point, angular_distance
+from .geometry import (
+    angle_from_dial_point,
+    angular_distance,
+    label_in_dial_ring,
+    minor_tick_spacing_degrees,
+    needle_angle_at_tick_ring,
+    point_on_dial,
+)
 from .interpolation import interpolate_reading
 from .models import (
     DialGeometry,
@@ -117,14 +124,17 @@ class GaugeReader:
                 confidence=confidence,
                 status="failed",
                 reason="not_enough_known_ticks",
-                needle_angle=observation.needle.angle,
+                needle_angle=_effective_needle_angle(observation),
                 unit=calibration.unit if calibration else observation.unit,
             )
 
+        needle_angle = _effective_needle_angle(observation)
+        minor_spacing = minor_tick_spacing_degrees(observation.ticks)
         interpolation = interpolate_reading(
-            observation.needle.angle,
+            needle_angle,
             value_ticks,
             direction=calibration.direction if calibration else None,
+            minor_tick_spacing=minor_spacing,
         )
         if interpolation is None:
             confidence = 0.35 * observation.needle.confidence + 0.15 * dial_confidence
@@ -133,7 +143,7 @@ class GaugeReader:
                 confidence=confidence,
                 status="failed",
                 reason="no_bracketing_ticks",
-                needle_angle=observation.needle.angle,
+                needle_angle=needle_angle,
                 unit=calibration.unit if calibration else observation.unit,
             )
 
@@ -149,7 +159,7 @@ class GaugeReader:
             confidence=confidence,
             status=status,
             reason="ok" if status == "ok" else "low_confidence",
-            needle_angle=observation.needle.angle,
+            needle_angle=needle_angle,
             unit=calibration.unit if calibration and calibration.unit else observation.unit,
             lower_tick=interpolation.lower_tick,
             upper_tick=interpolation.upper_tick,
@@ -162,7 +172,8 @@ class GaugeReader:
     ) -> list[ValueTick]:
         if calibration is not None and calibration.ticks:
             return self._value_ticks_from_calibration(observation.dial, calibration)
-        return associate_labels_to_ticks(observation.labels, observation.ticks, observation.dial)
+        filtered_labels = filter_labels_in_dial_ring(observation.labels, observation.dial)
+        return associate_labels_to_ticks(filtered_labels, observation.ticks, observation.dial)
 
     def _value_ticks_from_calibration(
         self,
@@ -206,11 +217,15 @@ class GaugeReader:
         dial = _choose_detection(observation.dial, extraction.dial, weak_threshold=0.58)
         needle = _choose_detection(observation.needle, extraction.needle, weak_threshold=0.62)
         needle = _needle_reprojected_to_dial(needle, dial)
+        merged_labels = filter_labels_in_dial_ring(
+            [*observation.labels, *extraction.labels],
+            dial,
+        )
         return GaugeObservation(
             dial=dial,
             needle=needle,
             ticks=[*observation.ticks, *extraction.ticks],
-            labels=[*observation.labels, *extraction.labels],
+            labels=merged_labels,
             unit=extraction.unit or observation.unit,
             debug=observation.debug,
             reason=observation.reason,
@@ -251,28 +266,57 @@ class GaugeReader:
         return GaugeCalibration.from_mapping(calibration)
 
 
+def filter_labels_in_dial_ring(
+    labels: list[NumericLabel],
+    dial: DialGeometry | None,
+    *,
+    inner_fraction: float = 0.25,
+    outer_fraction: float = 0.85,
+) -> list[NumericLabel]:
+    if dial is None:
+        return labels
+    filtered: list[NumericLabel] = []
+    for label in labels:
+        location = label.location
+        if location is None:
+            continue
+        if label_in_dial_ring(
+            dial,
+            location,
+            inner_fraction=inner_fraction,
+            outer_fraction=outer_fraction,
+        ):
+            filtered.append(label)
+    return filtered
+
+
 def associate_labels_to_ticks(
     labels: list[NumericLabel],
     ticks: list[TickDetection],
     dial: DialGeometry | None,
 ) -> list[ValueTick]:
+    """Map OCR/VLM labels to nearby tick marks; value angles come from ticks only."""
     value_ticks: list[ValueTick] = []
     normalized_ticks = _ticks_with_angles(ticks, dial)
     seen: set[tuple[float, int]] = set()
     for label in labels:
         label_point = label.location
-        label_angle = None
-        if label_point is not None and dial is not None:
-            label_angle = angle_from_dial_point(dial, label_point)
-        nearest_tick = _nearest_tick(label_angle, normalized_ticks)
-        if nearest_tick is not None and (label_angle is None or angular_distance(label_angle, nearest_tick.angle) <= 18.0):
+        if label_point is None or dial is None:
+            continue
+        label_angle = angle_from_dial_point(dial, label_point)
+        if normalized_ticks:
+            nearest_tick = _nearest_tick(label_angle, normalized_ticks)
+            if nearest_tick is None:
+                continue
+            if angular_distance(label_angle, nearest_tick.angle) > 18.0:
+                continue
             angle = nearest_tick.angle
             point = nearest_tick.point
             confidence = (label.confidence * 0.7) + (nearest_tick.confidence * 0.3)
-        elif label_angle is not None:
+        elif label.source.startswith("cloud"):
             angle = label_angle
-            point = label_point
-            confidence = label.confidence * 0.72
+            point = point_on_dial(dial, label_angle, 0.92)
+            confidence = label.confidence * 0.65
         else:
             continue
         key = (label.value, round(angle))
@@ -346,16 +390,27 @@ def _choose_detection(local: Any | None, cloud: Any | None, *, weak_threshold: f
     return local
 
 
+def _effective_needle_angle(observation: GaugeObservation) -> float:
+    needle = observation.needle
+    if needle is None:
+        return float("nan")
+    dial = observation.dial
+    if dial is not None and needle.end is not None:
+        return needle_angle_at_tick_ring(dial, needle)
+    return needle.angle
+
+
 def _needle_reprojected_to_dial(
     needle: NeedleDetection | None,
     dial: DialGeometry | None,
 ) -> NeedleDetection | None:
     if needle is None or dial is None or needle.end is None:
         return needle
-    return NeedleDetection(
-        angle=angle_from_dial_point(dial, needle.end),
+    reprojected = NeedleDetection(
+        angle=needle_angle_at_tick_ring(dial, needle),
         confidence=needle.confidence,
         start=needle.start or dial.center,
         end=needle.end,
         source=needle.source,
     )
+    return reprojected

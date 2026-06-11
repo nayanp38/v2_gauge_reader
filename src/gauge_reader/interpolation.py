@@ -2,18 +2,32 @@ from __future__ import annotations
 
 from math import isfinite
 
-from .geometry import normalize_direction, sweep_delta
+from .geometry import angular_distance, normalize_direction, sweep_delta
 from .models import InterpolationResult, ValueTick
+
+DEFAULT_SNAP_TOLERANCE_DEGREES = 2.5
+
+
+def snap_tolerance_degrees(minor_tick_spacing: float | None) -> float:
+    if minor_tick_spacing is None or minor_tick_spacing <= 0.0:
+        return DEFAULT_SNAP_TOLERANCE_DEGREES
+    return max(DEFAULT_SNAP_TOLERANCE_DEGREES, 0.25 * minor_tick_spacing)
 
 
 def interpolate_reading(
     needle_angle: float,
     value_ticks: list[ValueTick],
     direction: str | None = None,
+    *,
+    minor_tick_spacing: float | None = None,
 ) -> InterpolationResult | None:
     ticks = [tick for tick in value_ticks if isfinite(tick.angle) and isfinite(tick.value)]
     if len(ticks) < 2:
         return None
+
+    snapped = _try_snap_to_tick(needle_angle, ticks, minor_tick_spacing)
+    if snapped is not None:
+        return snapped
 
     normalized_direction = normalize_direction(direction)
     directions = ["clockwise", "counterclockwise"] if normalized_direction == "auto" else [normalized_direction]
@@ -55,6 +69,32 @@ def interpolate_reading(
 
     candidates.sort(key=lambda item: (item[0], item[1]))
     return candidates[0][2]
+
+
+def _try_snap_to_tick(
+    needle_angle: float,
+    ticks: list[ValueTick],
+    minor_tick_spacing: float | None,
+) -> InterpolationResult | None:
+    tolerance = snap_tolerance_degrees(minor_tick_spacing)
+    nearest: ValueTick | None = None
+    nearest_distance = tolerance
+    for tick in ticks:
+        distance = angular_distance(needle_angle, tick.angle)
+        if distance < nearest_distance:
+            nearest_distance = distance
+            nearest = tick
+    if nearest is None:
+        return None
+    return InterpolationResult(
+        reading=nearest.value,
+        confidence=max(0.05, min(1.0, nearest.confidence * 0.98)),
+        lower_tick=nearest,
+        upper_tick=nearest,
+        span_degrees=0.0,
+        direction="snap",
+        angular_fraction=0.0,
+    )
 
 
 def _span_confidence(span: float) -> float:

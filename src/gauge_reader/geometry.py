@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 
-from .models import DialGeometry, Point, TickDetection
+from .models import DialGeometry, NeedleDetection, Point, TickDetection
 
 
 def normalize_angle(angle: float) -> float:
@@ -82,6 +82,66 @@ def angle_between(start: float, target: float, end: float, direction: str, toler
     return offset <= span + tolerance
 
 
+def label_in_dial_ring(
+    dial: DialGeometry,
+    point: Point,
+    *,
+    inner_fraction: float = 0.25,
+    outer_fraction: float = 0.85,
+) -> bool:
+    """True when point lies inside the dial ellipse within the number-label ring."""
+    fraction = dial_radial_fraction(dial, point)
+    return inner_fraction <= fraction <= outer_fraction
+
+
+def needle_angle_at_tick_ring(
+    dial: DialGeometry,
+    needle: NeedleDetection,
+    *,
+    tick_ring_fraction: float = 0.92,
+) -> float:
+    """Extend the needle line to the tick ring and return the angle at that intersection."""
+    pivot = needle.start if needle.start is not None else dial.center
+    if needle.end is not None:
+        tip = needle.end
+    else:
+        return needle.angle
+
+    dx = tip.x - pivot.x
+    dy = tip.y - pivot.y
+    if math.hypot(dx, dy) < 1e-6:
+        return angle_from_dial_point(dial, tip)
+
+    low = 0.0
+    high = 1.0
+    low_frac = dial_radial_fraction(dial, _point_on_ray(pivot, dx, dy, low))
+    while high < 8.0 and dial_radial_fraction(dial, _point_on_ray(pivot, dx, dy, high)) < tick_ring_fraction:
+        high *= 2.0
+
+    for _ in range(48):
+        mid = (low + high) / 2.0
+        if dial_radial_fraction(dial, _point_on_ray(pivot, dx, dy, mid)) < tick_ring_fraction:
+            low = mid
+        else:
+            high = mid
+
+    intersection = _point_on_ray(pivot, dx, dy, (low + high) / 2.0)
+    return angle_from_dial_point(dial, intersection)
+
+
+def minor_tick_spacing_degrees(ticks: Iterable[TickDetection]) -> float | None:
+    """Estimate minor-tick angular spacing from adjacent detected ticks."""
+    angles = sorted(normalize_angle(tick.angle) for tick in ticks if math.isfinite(tick.angle))
+    if len(angles) < 2:
+        return None
+    spacings = [
+        angular_distance(angles[index], angles[(index + 1) % len(angles)])
+        for index in range(len(angles))
+    ]
+    spacings.sort()
+    return spacings[len(spacings) // 2]
+
+
 def merge_ticks_by_angle(ticks: Iterable[TickDetection], tolerance_degrees: float = 2.0) -> list[TickDetection]:
     ordered = sorted(ticks, key=lambda tick: tick.angle)
     clusters: list[list[TickDetection]] = []
@@ -112,6 +172,10 @@ def merge_ticks_by_angle(ticks: Iterable[TickDetection], tolerance_degrees: floa
             )
         )
     return sorted(merged, key=lambda tick: tick.angle)
+
+
+def _point_on_ray(pivot: Point, dx: float, dy: float, scale: float) -> Point:
+    return Point(pivot.x + dx * scale, pivot.y + dy * scale)
 
 
 def _ellipse_local_coordinates(dial: DialGeometry, point: Point) -> tuple[float, float]:

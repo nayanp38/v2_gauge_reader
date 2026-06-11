@@ -17,7 +17,11 @@ from gauge_reader.models import (
     Point,
     TickDetection,
 )
-from gauge_reader.reader import GaugeReader, associate_labels_to_ticks
+from gauge_reader.reader import (
+    GaugeReader,
+    associate_labels_to_ticks,
+    filter_labels_in_dial_ring,
+)
 
 
 class FakePipeline:
@@ -100,9 +104,9 @@ class ReaderTests(unittest.TestCase):
         cloud = FakeCloud(
             VisionExtraction(
                 labels=[
-                    NumericLabel(value=0, text="0", center=Point(43.4, 156.6), confidence=0.9, source="cloud"),
-                    NumericLabel(value=50, text="50", center=Point(100, 20), confidence=0.9, source="cloud"),
-                    NumericLabel(value=100, text="100", center=Point(156.6, 156.6), confidence=0.9, source="cloud"),
+                    NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=50, text="50", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=100, text="100", center=point_on_dial(dial, 315, 0.72), confidence=0.9, source="cloud"),
                 ]
             )
         )
@@ -167,6 +171,24 @@ class ReaderTests(unittest.TestCase):
         assert extraction.needle is not None
         self.assertAlmostEqual(extraction.dial.radius, 80)
         self.assertAlmostEqual(extraction.needle.angle, 90)
+
+    def test_filters_labels_outside_dial_ring(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        labels = [
+            NumericLabel(value=5, text="5", center=point_on_dial(dial, 90, 0.72), confidence=0.9),
+            NumericLabel(value=99, text="99", center=Point(10, 10), confidence=0.9),
+        ]
+        filtered = filter_labels_in_dial_ring(labels, dial)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0].value, 5)
+
+    def test_associate_requires_tick_mark_for_value_angle(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        labels = [
+            NumericLabel(value=40, text="40", bbox=BBox(92, 18, 16, 12), confidence=0.9),
+        ]
+        value_ticks = associate_labels_to_ticks(labels, [], dial)
+        self.assertEqual(value_ticks, [])
 
     def test_failed_when_needle_missing(self) -> None:
         observation = GaugeObservation(dial=DialGeometry(Point(100, 100), 80, confidence=0.9), needle=None)
