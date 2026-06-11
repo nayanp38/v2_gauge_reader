@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from gauge_reader.cloud import CloudVisionAdapter, VisionExtraction
+from gauge_reader.cloud import CloudVisionAdapter, VisionExtraction, extraction_from_mapping
 from gauge_reader.geometry import point_on_dial
 from gauge_reader.models import (
     BBox,
@@ -112,6 +112,61 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertAlmostEqual(result.reading or 0, 50.0, places=1)
         self.assertEqual(result.reason, "ok_cloud_fallback")
+
+    def test_cloud_fallback_can_supply_missing_needle_with_calibration(self) -> None:
+        observation = GaugeObservation(
+            dial=DialGeometry(Point(100, 100), 80, confidence=0.9),
+            needle=None,
+        )
+        cloud = FakeCloud(
+            VisionExtraction(
+                needle=NeedleDetection(
+                    angle=90,
+                    confidence=0.9,
+                    start=Point(100, 100),
+                    end=Point(100, 20),
+                    source="cloud",
+                )
+            )
+        )
+        reader = GaugeReader(pipeline=FakePipeline(observation), cloud_adapter=cloud, use_cloud=True)
+        result = reader.read(
+            "unused.jpg",
+            calibration={
+                "ticks": [
+                    {"value": 0, "angle": 225},
+                    {"value": 100, "angle": 315},
+                ],
+            },
+        )
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.reading or 0, 50.0)
+        self.assertEqual(result.reason, "ok_cloud_fallback")
+
+    def test_cloud_mapping_parses_dial_and_needle(self) -> None:
+        extraction = extraction_from_mapping(
+            {
+                "dial": {
+                    "center": [100, 100],
+                    "radius": 80,
+                    "bbox": [20, 20, 160, 160],
+                    "confidence": 0.8,
+                },
+                "needle": {
+                    "base": [100, 100],
+                    "tip": [100, 20],
+                    "confidence": 0.9,
+                },
+            },
+            source="test",
+        )
+        self.assertIsNotNone(extraction.dial)
+        self.assertIsNotNone(extraction.needle)
+        assert extraction.dial is not None
+        assert extraction.needle is not None
+        self.assertAlmostEqual(extraction.dial.radius, 80)
+        self.assertAlmostEqual(extraction.needle.angle, 90)
 
     def test_failed_when_needle_missing(self) -> None:
         observation = GaugeObservation(dial=DialGeometry(Point(100, 100), 80, confidence=0.9), needle=None)

@@ -72,10 +72,25 @@ Point-based calibration is converted to an angle using the detected dial center.
 
 ## Cloud Fallback
 
-The simplest cloud integration is command-based. Set `GAUGE_READER_CLOUD_COMMAND` to a command that returns JSON:
+The cloud integration is command-based. The built-in Gemini adapter can be used like this:
 
 ```bash
-export GAUGE_READER_CLOUD_COMMAND='python3 my_vlm_adapter.py {image}'
+python3 -m pip install -e ".[cloud]"
+export GEMINI_API_KEY='your-api-key'
+export GAUGE_READER_CLOUD_COMMAND='gauge-vlm-gemini "{image}"'
+gauge-read gauge.jpg --debug out/
+```
+
+You can choose a model with:
+
+```bash
+export GAUGE_READER_GEMINI_MODEL='gemini-robotics-er-1.6-preview'
+```
+
+The adapter focuses on visible numeric dial labels and returns JSON to the main reader:
+
+```bash
+gauge-vlm-gemini gauge.jpg
 ```
 
 Expected output:
@@ -92,7 +107,7 @@ Expected output:
 }
 ```
 
-If `GAUGE_READER_CLOUD_COMMAND` is unset, the reader stays local.
+You can also provide your own command by setting `GAUGE_READER_CLOUD_COMMAND` to any executable that prints the same JSON shape. If `GAUGE_READER_CLOUD_COMMAND` is unset, the reader stays local.
 
 ## Python API
 

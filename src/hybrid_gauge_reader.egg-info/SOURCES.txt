@@ -4,6 +4,7 @@ src/gauge_reader/__init__.py
 src/gauge_reader/cli.py
 src/gauge_reader/cloud.py
 src/gauge_reader/cv_pipeline.py
+src/gauge_reader/gemini_vlm_adapter.py
 src/gauge_reader/geometry.py
 src/gauge_reader/interpolation.py
 src/gauge_reader/models.py
@@ -15,6 +16,7 @@ src/hybrid_gauge_reader.egg-info/dependency_links.txt
 src/hybrid_gauge_reader.egg-info/entry_points.txt
 src/hybrid_gauge_reader.egg-info/requires.txt
 src/hybrid_gauge_reader.egg-info/top_level.txt
+tests/test_gemini_vlm_adapter.py
 tests/test_geometry.py
 tests/test_reader.py
 tests/test_synthetic_scenarios.py

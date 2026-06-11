@@ -14,6 +14,7 @@ from .models import (
     GaugeCalibration,
     GaugeObservation,
     GaugeReading,
+    NeedleDetection,
     NumericLabel,
     Point,
     TickDetection,
@@ -63,7 +64,7 @@ class GaugeReader:
         used_cloud = False
         if (
             self.use_cloud
-            and calibration_obj is None
+            and (calibration_obj is None or result.reason == "needle_not_found")
             and (result.reading is None or result.confidence < self.confidence_threshold)
         ):
             cloud_observation = self._augment_with_cloud(image_path, observation)
@@ -194,11 +195,20 @@ class GaugeReader:
                 "dial": observation.dial.to_dict() if observation.dial else None,
             },
         )
-        if not extraction.labels and not extraction.ticks and extraction.unit is None:
+        if (
+            not extraction.labels
+            and not extraction.ticks
+            and extraction.unit is None
+            and extraction.dial is None
+            and extraction.needle is None
+        ):
             return observation
+        dial = _choose_detection(observation.dial, extraction.dial, weak_threshold=0.58)
+        needle = _choose_detection(observation.needle, extraction.needle, weak_threshold=0.62)
+        needle = _needle_reprojected_to_dial(needle, dial)
         return GaugeObservation(
-            dial=observation.dial,
-            needle=observation.needle,
+            dial=dial,
+            needle=needle,
             ticks=[*observation.ticks, *extraction.ticks],
             labels=[*observation.labels, *extraction.labels],
             unit=extraction.unit or observation.unit,
@@ -322,3 +332,30 @@ def _combined_confidence(
         + 0.15 * max(0.0, min(1.0, tick_confidence))
     )
     return max(0.0, min(1.0, confidence))
+
+
+def _choose_detection(local: Any | None, cloud: Any | None, *, weak_threshold: float) -> Any | None:
+    if cloud is None:
+        return local
+    if local is None:
+        return cloud
+    local_confidence = float(getattr(local, "confidence", 0.0))
+    cloud_confidence = float(getattr(cloud, "confidence", 0.0))
+    if local_confidence < weak_threshold or cloud_confidence > local_confidence + 0.10:
+        return cloud
+    return local
+
+
+def _needle_reprojected_to_dial(
+    needle: NeedleDetection | None,
+    dial: DialGeometry | None,
+) -> NeedleDetection | None:
+    if needle is None or dial is None or needle.end is None:
+        return needle
+    return NeedleDetection(
+        angle=angle_from_dial_point(dial, needle.end),
+        confidence=needle.confidence,
+        start=needle.start or dial.center,
+        end=needle.end,
+        source=needle.source,
+    )

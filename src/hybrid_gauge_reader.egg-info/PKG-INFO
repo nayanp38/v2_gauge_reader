@@ -27,6 +27,8 @@ This project reads single-needle radial analogue gauges by localizing the needle
 5. Interpolate the needle position between the closest known values.
 6. Fall back to manual calibration or a cloud OCR/VLM adapter when local extraction is weak.
 
+For camera-perspective distortion, the local CV path first tries to fit the dial boundary as an ellipse. Tick, label, and needle angles are then measured in ellipse-normalized dial space, and the effective needle pivot is refined from the convergence of radial tick/needle-like line segments when enough candidates are visible. This is more stable than assuming the photographed gauge is a centered circle.
+
 ## Install
 
 Core geometry and tests use only the Python standard library. For real image reading, install the CV extras:
@@ -88,10 +90,25 @@ Point-based calibration is converted to an angle using the detected dial center.
 
 ## Cloud Fallback
 
-The simplest cloud integration is command-based. Set `GAUGE_READER_CLOUD_COMMAND` to a command that returns JSON:
+The cloud integration is command-based. The built-in Gemini adapter can be used like this:
 
 ```bash
-export GAUGE_READER_CLOUD_COMMAND='python3 my_vlm_adapter.py {image}'
+python3 -m pip install -e ".[cloud]"
+export GEMINI_API_KEY='your-api-key'
+export GAUGE_READER_CLOUD_COMMAND='gauge-vlm-gemini "{image}"'
+gauge-read gauge.jpg --debug out/
+```
+
+You can choose a model with:
+
+```bash
+export GAUGE_READER_GEMINI_MODEL='gemini-2.5-flash'
+```
+
+The adapter focuses on visible numeric dial labels and returns JSON to the main reader:
+
+```bash
+gauge-vlm-gemini gauge.jpg
 ```
 
 Expected output:
@@ -108,7 +125,7 @@ Expected output:
 }
 ```
 
-If `GAUGE_READER_CLOUD_COMMAND` is unset, the reader stays local.
+You can also provide your own command by setting `GAUGE_READER_CLOUD_COMMAND` to any executable that prints the same JSON shape. If `GAUGE_READER_CLOUD_COMMAND` is unset, the reader stays local.
 
 ## Python API
 
