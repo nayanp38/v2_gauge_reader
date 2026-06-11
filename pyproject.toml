@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid-gauge-reader"
+version = "0.1.0"
+description = "Hybrid local-CV analogue gauge reader with optional cloud OCR fallback."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Relay" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+cv = [
+  "numpy>=1.26",
+  "opencv-python-headless>=4.8",
+]
+ocr = [
+  "Pillow>=10.0",
+  "pytesseract>=0.3.10",
+]
+cloud = [
+  "google-genai>=1.0.0",
+]
+dev = []
+
+[project.scripts]
+gauge-read = "gauge_reader.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

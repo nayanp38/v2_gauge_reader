@@ -1,0 +1,13 @@
+
+[cloud]
+google-genai>=1.0.0
+
+[cv]
+numpy>=1.26
+opencv-python-headless>=4.8
+
+[dev]
+
+[ocr]
+Pillow>=10.0
+pytesseract>=0.3.10

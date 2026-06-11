@@ -1,0 +1,2 @@
+[console_scripts]
+gauge-read = gauge_reader.cli:main
