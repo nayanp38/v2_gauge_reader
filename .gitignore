@@ -1,1 +1,51 @@
+# Environment and secrets
 .env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging / build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# CLI debug output
+out/
+
+# Dataset evaluation runs
+eval_runs/
+
+# Gauge Label Lab outputs
+labeled_gauge_images/
+gauge_labels.csv
+
+# Ad-hoc synth dataset samples copied into repo root
+v_*_f_*_rgba.png
+v_*_f_*_rgba.json

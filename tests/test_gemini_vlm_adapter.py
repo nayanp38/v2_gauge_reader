@@ -117,20 +117,83 @@ class GeminiVLMAdapterTests(unittest.TestCase):
         self.assertEqual(normalized["needle"]["tip"], [500.0, 100.0])
         self.assertEqual(normalized["labels"][0]["bbox"], [200.0, 50.0, 300.0, 100.0])
 
+    def test_parse_label_center_point_when_box_is_missing(self) -> None:
+        response = FakeObject(
+            text='{"labels": [{"center_point": [100, 200], "label": "40"}]}'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "test.png"
+            image_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR"
+                b"\x00\x00\x03\xe8"
+                b"\x00\x00\x01\xf4"
+                b"\x08\x02\x00\x00\x00"
+            )
+            parsed = parse_gemini_response(response, image_path)
+            normalized = normalize_payload(parsed)
+
+        self.assertEqual(normalized["labels"][0]["text"], "40")
+        self.assertEqual(normalized["labels"][0]["value"], 40.0)
+        self.assertEqual(normalized["labels"][0]["center"], [200.0, 50.0])
+        self.assertNotIn("bbox", normalized["labels"][0])
+
+    def test_parse_box_aliases_from_model_response(self) -> None:
+        response = FakeObject(
+            text='{"labels": [{"bounding_box": [100, 200, 300, 500], "number": "40"}]}'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "test.png"
+            image_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR"
+                b"\x00\x00\x03\xe8"
+                b"\x00\x00\x01\xf4"
+                b"\x08\x02\x00\x00\x00"
+            )
+            parsed = parse_gemini_response(response, image_path)
+
+        self.assertEqual(parsed["labels"][0]["value"], 40.0)
+        self.assertEqual(parsed["labels"][0]["bbox"], [200.0, 50.0, 300.0, 100.0])
+
+    def test_diagnostics_show_when_raw_labels_were_dropped_for_missing_geometry(self) -> None:
+        response = FakeObject(
+            text='{"labels": [{"label": "40"}, {"box_2d": [100, 200, 300, 500], "label": "50"}]}'
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "test.png"
+            diagnostics_path = Path(tmpdir) / "diagnostics.json"
+            image_path.write_bytes(
+                b"\x89PNG\r\n\x1a\n"
+                b"\x00\x00\x00\rIHDR"
+                b"\x00\x00\x03\xe8"
+                b"\x00\x00\x01\xf4"
+                b"\x08\x02\x00\x00\x00"
+            )
+            parsed = parse_gemini_response(response, image_path, diagnostics_path=diagnostics_path)
+            diagnostics = json.loads(diagnostics_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(parsed["labels"]), 1)
+        self.assertEqual(diagnostics["counts"]["raw_labels"], 2)
+        self.assertEqual(diagnostics["counts"]["converted_labels"], 1)
+        self.assertEqual(diagnostics["counts"]["dropped_raw_labels"], 1)
+
     def test_normalize_payload_filters_bad_labels(self) -> None:
         normalized = normalize_payload(
             {
                 "unit": "bar",
                 "labels": [
                     {"text": "10", "value": "10", "bbox": [1, 2, 3, 4], "confidence": 2},
+                    {"text": "11", "value": "11", "center": [4, 5], "confidence": 0.7},
                     {"text": "bad", "value": "bad", "bbox": [1, 2, 3, 4], "confidence": 0.8},
                     {"text": "bad", "value": 20, "bbox": [1, 2, 3], "confidence": 0.8},
                 ],
             }
         )
         self.assertEqual(normalized["unit"], "bar")
-        self.assertEqual(len(normalized["labels"]), 1)
+        self.assertEqual(len(normalized["labels"]), 2)
         self.assertEqual(normalized["labels"][0]["confidence"], 1.0)
+        self.assertEqual(normalized["labels"][1]["center"], [4.0, 5.0])
         self.assertEqual(normalized["ticks"], [])
 
 

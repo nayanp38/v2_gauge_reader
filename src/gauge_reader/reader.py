@@ -2,10 +2,18 @@ from __future__ import annotations
 
 import json
 import math
+import tempfile
 from pathlib import Path
 from typing import Any
 
-from .cloud import CloudVisionAdapter, default_cloud_adapter
+from .cloud import CloudVisionAdapter, VisionExtraction, default_cloud_adapter, forced_cloud_ocr_adapter
+from .cropping import (
+    dial_crop_box,
+    translate_dial,
+    translate_needle,
+    translate_numeric_labels,
+    translate_tick,
+)
 from .cv_pipeline import ImageReadError, LocalCVPipeline, MissingDependencyError
 from .geometry import (
     angle_from_dial_point,
@@ -36,11 +44,21 @@ class GaugeReader:
         pipeline: Any | None = None,
         cloud_adapter: CloudVisionAdapter | None = None,
         use_cloud: bool = True,
+        force_cloud_ocr: bool = False,
+        crop_cloud_to_dial: bool = True,
         confidence_threshold: float = 0.65,
     ):
         self.pipeline = pipeline or LocalCVPipeline()
-        self.cloud_adapter = cloud_adapter if cloud_adapter is not None else default_cloud_adapter()
-        self.use_cloud = use_cloud
+        self.cloud_adapter = (
+            cloud_adapter
+            if cloud_adapter is not None
+            else forced_cloud_ocr_adapter()
+            if force_cloud_ocr
+            else default_cloud_adapter()
+        )
+        self.use_cloud = use_cloud or force_cloud_ocr
+        self.force_cloud_ocr = force_cloud_ocr
+        self.crop_cloud_to_dial = crop_cloud_to_dial
         self.confidence_threshold = confidence_threshold
 
     def read(
@@ -53,42 +71,97 @@ class GaugeReader:
         try:
             observation = self.pipeline.process(image_path)
         except MissingDependencyError as exc:
-            return GaugeReading(
+            local_failure = GaugeReading(
                 reading=None,
                 confidence=0.0,
                 status="failed",
                 reason=f"missing_image_dependencies: {exc}",
             )
+            cloud_attempt = self._read_with_cloud_only(image_path, calibration_obj)
+            if cloud_attempt is not None:
+                cloud_observation, cloud_result = cloud_attempt
+                if _prefer_cloud_result(local_failure, cloud_result):
+                    return self._finalize_reading(
+                        image_path,
+                        cloud_observation,
+                        cloud_result,
+                        debug_dir,
+                        used_cloud=True,
+                    )
+            return local_failure
         except ImageReadError as exc:
-            return GaugeReading(
+            local_failure = GaugeReading(
                 reading=None,
                 confidence=0.0,
                 status="failed",
                 reason=str(exc),
             )
+            cloud_attempt = self._read_with_cloud_only(image_path, calibration_obj)
+            if cloud_attempt is not None:
+                cloud_observation, cloud_result = cloud_attempt
+                if _prefer_cloud_result(local_failure, cloud_result):
+                    return self._finalize_reading(
+                        image_path,
+                        cloud_observation,
+                        cloud_result,
+                        debug_dir,
+                        used_cloud=True,
+                    )
+            return local_failure
+
+        used_cloud = False
+        cloud_mode = "fallback"
+        if self.force_cloud_ocr:
+            cloud_observation = self._augment_with_cloud(
+                image_path,
+                observation,
+                force_ocr=True,
+            )
+            if cloud_observation is not observation:
+                observation = cloud_observation
+                used_cloud = True
+                cloud_mode = "ocr"
 
         result = self._read_from_observation(observation, calibration_obj)
-        used_cloud = False
         if (
             self.use_cloud
-            and (calibration_obj is None or result.reason == "needle_not_found")
+            and not self.force_cloud_ocr
             and (result.reading is None or result.confidence < self.confidence_threshold)
         ):
             cloud_observation = self._augment_with_cloud(image_path, observation)
             if cloud_observation is not observation:
                 cloud_result = self._read_from_observation(cloud_observation, calibration_obj)
-                if cloud_result.confidence >= result.confidence:
+                if _prefer_cloud_result(result, cloud_result):
                     observation = cloud_observation
                     result = cloud_result
                     used_cloud = True
 
+        return self._finalize_reading(
+            image_path,
+            observation,
+            result,
+            debug_dir,
+            used_cloud=used_cloud,
+            cloud_mode=cloud_mode,
+        )
+
+    def _finalize_reading(
+        self,
+        image_path: str | Path,
+        observation: GaugeObservation,
+        result: GaugeReading,
+        debug_dir: str | Path | None,
+        *,
+        used_cloud: bool,
+        cloud_mode: str = "fallback",
+    ) -> GaugeReading:
         debug = dict(result.debug)
         if debug_dir is not None:
             debug.update(self._write_debug(image_path, observation, result, debug_dir))
 
         reason = result.reason
         if used_cloud and reason == "ok":
-            reason = "ok_cloud_fallback"
+            reason = "ok_cloud_ocr" if cloud_mode == "ocr" else "ok_cloud_fallback"
         return GaugeReading(
             reading=result.reading,
             confidence=result.confidence,
@@ -100,6 +173,19 @@ class GaugeReader:
             upper_tick=result.upper_tick,
             debug=debug,
         )
+
+    def _read_with_cloud_only(
+        self,
+        image_path: str | Path,
+        calibration: GaugeCalibration | None,
+    ) -> tuple[GaugeObservation, GaugeReading] | None:
+        if not self.use_cloud:
+            return None
+        empty_observation = GaugeObservation(dial=None, needle=None)
+        cloud_observation = self._augment_with_cloud(image_path, empty_observation)
+        if cloud_observation is empty_observation:
+            return None
+        return cloud_observation, self._read_from_observation(cloud_observation, calibration)
 
     def _read_from_observation(
         self,
@@ -198,14 +284,14 @@ class GaugeReader:
             )
         return value_ticks
 
-    def _augment_with_cloud(self, image_path: str | Path, observation: GaugeObservation) -> GaugeObservation:
-        extraction = self.cloud_adapter.extract(
-            image_path,
-            context={
-                "needle_angle": observation.needle.angle if observation.needle else None,
-                "dial": observation.dial.to_dict() if observation.dial else None,
-            },
-        )
+    def _augment_with_cloud(
+        self,
+        image_path: str | Path,
+        observation: GaugeObservation,
+        *,
+        force_ocr: bool = False,
+    ) -> GaugeObservation:
+        extraction = self._extract_cloud(image_path, observation)
         if (
             not extraction.labels
             and not extraction.ticks
@@ -213,12 +299,23 @@ class GaugeReader:
             and extraction.dial is None
             and extraction.needle is None
         ):
+            if force_ocr and observation.labels:
+                return GaugeObservation(
+                    dial=observation.dial,
+                    needle=observation.needle,
+                    ticks=observation.ticks,
+                    labels=[],
+                    unit=observation.unit,
+                    debug=observation.debug,
+                    reason=observation.reason,
+                )
             return observation
         dial = _choose_detection(observation.dial, extraction.dial, weak_threshold=0.58)
         needle = _choose_detection(observation.needle, extraction.needle, weak_threshold=0.62)
         needle = _needle_reprojected_to_dial(needle, dial)
+        labels = extraction.labels if force_ocr else [*observation.labels, *extraction.labels]
         merged_labels = filter_labels_in_dial_ring(
-            [*observation.labels, *extraction.labels],
+            labels,
             dial,
         )
         return GaugeObservation(
@@ -230,6 +327,67 @@ class GaugeReader:
             debug=observation.debug,
             reason=observation.reason,
         )
+
+    def _extract_cloud(self, image_path: str | Path, observation: GaugeObservation) -> VisionExtraction:
+        crop = self._write_cloud_crop(image_path, observation.dial)
+        if crop is None:
+            return self.cloud_adapter.extract(image_path, context=_cloud_context(observation))
+
+        crop_path, crop_offset = crop
+        crop_observation = GaugeObservation(
+            dial=translate_dial(observation.dial, Point(-crop_offset.x, -crop_offset.y)),
+            needle=translate_needle(observation.needle, Point(-crop_offset.x, -crop_offset.y)),
+            ticks=[translate_tick(tick, Point(-crop_offset.x, -crop_offset.y)) for tick in observation.ticks],
+            labels=translate_numeric_labels(observation.labels, Point(-crop_offset.x, -crop_offset.y)),
+            unit=observation.unit,
+            debug=observation.debug,
+            reason=observation.reason,
+        )
+        try:
+            extraction = self.cloud_adapter.extract(crop_path, context=_cloud_context(crop_observation))
+            return _translate_extraction(extraction, crop_offset)
+        finally:
+            try:
+                crop_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _write_cloud_crop(self, image_path: str | Path, dial: DialGeometry | None) -> tuple[Path, Point] | None:
+        if not self.crop_cloud_to_dial or dial is None:
+            return None
+        image_file = Path(image_path)
+        if not image_file.is_file():
+            return None
+        try:
+            import cv2
+        except Exception:
+            return None
+
+        image = cv2.imread(str(image_file), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            return None
+        height, width = image.shape[:2]
+        crop_box = dial_crop_box(dial, width, height)
+        if crop_box is None:
+            return None
+
+        x0 = int(crop_box.x)
+        y0 = int(crop_box.y)
+        x1 = int(crop_box.x + crop_box.width)
+        y1 = int(crop_box.y + crop_box.height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+
+        suffix = image_file.suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}:
+            suffix = ".png"
+        temp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        temp_path = Path(temp.name)
+        temp.close()
+        if not cv2.imwrite(str(temp_path), image[y0:y1, x0:x1]):
+            temp_path.unlink(missing_ok=True)
+            return None
+        return temp_path, Point(crop_box.x, crop_box.y)
 
     def _write_debug(
         self,
@@ -306,13 +464,16 @@ def associate_labels_to_ticks(
         label_angle = angle_from_dial_point(dial, label_point)
         if normalized_ticks:
             nearest_tick = _nearest_tick(label_angle, normalized_ticks)
-            if nearest_tick is None:
+            if nearest_tick is not None and angular_distance(label_angle, nearest_tick.angle) <= 5.0:
+                angle = nearest_tick.angle
+                point = nearest_tick.point
+                confidence = (label.confidence * 0.7) + (nearest_tick.confidence * 0.3)
+            elif label.source.startswith("cloud"):
+                angle = label_angle
+                point = point_on_dial(dial, label_angle, 0.92)
+                confidence = label.confidence * 0.55
+            else:
                 continue
-            if angular_distance(label_angle, nearest_tick.angle) > 18.0:
-                continue
-            angle = nearest_tick.angle
-            point = nearest_tick.point
-            confidence = (label.confidence * 0.7) + (nearest_tick.confidence * 0.3)
         elif label.source.startswith("cloud"):
             angle = label_angle
             point = point_on_dial(dial, label_angle, 0.92)
@@ -376,6 +537,35 @@ def _combined_confidence(
         + 0.15 * max(0.0, min(1.0, tick_confidence))
     )
     return max(0.0, min(1.0, confidence))
+
+
+def _prefer_cloud_result(local: GaugeReading, cloud: GaugeReading) -> bool:
+    if cloud.reading is not None and local.reading is None:
+        return True
+    if cloud.reading is None and local.reading is not None:
+        return False
+    return cloud.confidence >= local.confidence
+
+
+def _has_calibration_ticks(calibration: GaugeCalibration | None) -> bool:
+    return calibration is not None and bool(calibration.ticks)
+
+
+def _cloud_context(observation: GaugeObservation) -> dict[str, Any]:
+    return {
+        "needle_angle": observation.needle.angle if observation.needle else None,
+        "dial": observation.dial.to_dict() if observation.dial else None,
+    }
+
+
+def _translate_extraction(extraction: VisionExtraction, offset: Point) -> VisionExtraction:
+    return VisionExtraction(
+        labels=translate_numeric_labels(extraction.labels, offset),
+        ticks=[translate_tick(tick, offset) for tick in extraction.ticks],
+        dial=translate_dial(extraction.dial, offset),
+        needle=translate_needle(extraction.needle, offset),
+        unit=extraction.unit,
+    )
 
 
 def _choose_detection(local: Any | None, cloud: Any | None, *, weak_threshold: float) -> Any | None:

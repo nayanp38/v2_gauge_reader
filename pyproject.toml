@@ -29,6 +29,7 @@ dev = []
 [project.scripts]
 gauge-read = "gauge_reader.cli:main"
 gauge-vlm-gemini = "gauge_reader.gemini_vlm_adapter:main"
+gauge-eval = "gauge_reader.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

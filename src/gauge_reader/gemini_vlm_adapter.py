@@ -25,6 +25,8 @@ Find:
 
 Ignore logos, serial numbers, units, annotations, reflections, and camera UI text.
 Do not return masks, prose, explanations, or markdown fences.
+For every numeric label, return a box_2d. If you truly cannot provide a box,
+return center_point for that label instead. Do not return label-only entries.
 
 Return this shape:
 {
@@ -53,13 +55,19 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                         "minItems": 4,
                         "maxItems": 4,
                     },
+                    "center": {
+                        "type": "array",
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2,
+                    },
                     "confidence": {
                         "type": "number",
                         "minimum": 0,
                         "maximum": 1,
                     },
                 },
-                "required": ["text", "value", "bbox", "confidence"],
+                "required": ["text", "value", "confidence"],
             },
         },
         "dial": {
@@ -146,6 +154,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("GAUGE_READER_GEMINI_MAX_OUTPUT_TOKENS", "2048")),
         help="Maximum output tokens.",
     )
+    parser.add_argument(
+        "--diagnostics",
+        default=os.environ.get("GAUGE_READER_GEMINI_DIAGNOSTICS"),
+        help="Optional path to write raw/parsed response diagnostics for parser debugging.",
+    )
     return parser
 
 
@@ -157,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             temperature=args.temperature,
             max_output_tokens=args.max_output_tokens,
+            diagnostics_path=Path(args.diagnostics) if args.diagnostics else None,
         )
     except Exception as exc:
         print(f"gemini_vlm_adapter: {exc}", file=sys.stderr)
@@ -172,6 +186,7 @@ def extract_gauge_labels(
     model: str = DEFAULT_MODEL,
     temperature: float = 0.0,
     max_output_tokens: int = 2048,
+    diagnostics_path: Path | None = None,
 ) -> dict[str, Any]:
     if not image_path.exists():
         raise FileNotFoundError(f"image not found: {image_path}")
@@ -199,7 +214,7 @@ def extract_gauge_labels(
         ),
     )
 
-    return parse_gemini_response(response, image_path)
+    return parse_gemini_response(response, image_path, diagnostics_path=diagnostics_path)
 
 
 def normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -229,14 +244,22 @@ def parse_json_response(text: str) -> Any:
     return parsed
 
 
-def parse_gemini_response(response: Any, image_path: Path) -> dict[str, Any]:
+def parse_gemini_response(
+    response: Any,
+    image_path: Path,
+    diagnostics_path: Path | None = None,
+) -> dict[str, Any]:
     raw_text = _text_from_response(response)
+    parsed: Any = None
+    payload: dict[str, Any] | None = None
     try:
         parsed = parse_json_response(raw_text)
         payload = _payload_from_model_json(parsed, _read_image_size(image_path))
         _validate_against_response_schema(payload)
+        _write_diagnostics(diagnostics_path, raw_text=raw_text, parsed=parsed, payload=payload)
         return payload
-    except Exception:
+    except Exception as exc:
+        _write_diagnostics(diagnostics_path, raw_text=raw_text, parsed=parsed, payload=payload, error=exc)
         print(f"gemini_vlm_adapter raw response: {raw_text}", file=sys.stderr)
         raise
 
@@ -293,6 +316,89 @@ def _parse_json_from_markdown_or_text(text: str) -> Any:
     if start >= 0 and end > start:
         return json.loads(cleaned[start : end + 1])
     raise ValueError("model response did not contain JSON")
+
+
+def _write_diagnostics(
+    diagnostics_path: Path | None,
+    *,
+    raw_text: str,
+    parsed: Any,
+    payload: dict[str, Any] | None,
+    error: Exception | None = None,
+) -> None:
+    if diagnostics_path is None:
+        return
+    report = _diagnostics_report(raw_text=raw_text, parsed=parsed, payload=payload, error=error)
+    diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+    with diagnostics_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+
+
+def _diagnostics_report(
+    *,
+    raw_text: str,
+    parsed: Any,
+    payload: dict[str, Any] | None,
+    error: Exception | None,
+) -> dict[str, Any]:
+    raw_labels = _raw_label_items(parsed)
+    raw_label_stats = [_raw_label_stat(item) for item in raw_labels]
+    converted_labels = payload.get("labels", []) if isinstance(payload, dict) else []
+    report: dict[str, Any] = {
+        "raw_text": raw_text,
+        "parsed": parsed,
+        "payload": payload,
+        "counts": {
+            "raw_labels": len(raw_labels),
+            "raw_labels_with_numeric_text": sum(1 for item in raw_label_stats if item["has_numeric_text"]),
+            "raw_labels_with_box": sum(1 for item in raw_label_stats if item["has_box"]),
+            "raw_labels_with_center": sum(1 for item in raw_label_stats if item["has_center"]),
+            "converted_labels": len(converted_labels),
+            "converted_labels_with_bbox": sum(1 for item in converted_labels if _is_bbox(item.get("bbox"))),
+            "converted_labels_with_center": sum(1 for item in converted_labels if _is_point(item.get("center"))),
+            "dropped_raw_labels": max(0, len(raw_labels) - len(converted_labels)),
+        },
+        "raw_label_stats": raw_label_stats,
+    }
+    if error is not None:
+        report["error"] = f"{type(error).__name__}: {error}"
+    return report
+
+
+def _raw_label_items(parsed: Any) -> list[Any]:
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        labels = parsed.get("labels")
+        if isinstance(labels, list):
+            return labels
+        if "box_2d" in parsed or "bbox" in parsed:
+            return [parsed]
+    return []
+
+
+def _raw_label_stat(item: Any) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        return {
+            "kind": type(item).__name__,
+            "has_numeric_text": _numeric_value_from_text(str(item)) is not None,
+            "has_box": False,
+            "has_center": False,
+            "keys": [],
+        }
+    text = str(_first_present(item, ("label", "text", "number", "value", "name")) or "")
+    return {
+        "kind": "object",
+        "text": text,
+        "has_numeric_text": _numeric_value_from_text(text) is not None,
+        "has_box": _is_bbox(
+            _first_present(item, ("box_2d", "bbox", "bounding_box", "boundingBox", "box", "box2d"))
+        ),
+        "has_center": _is_point(
+            _first_present(item, ("center_point", "center", "point", "location"))
+        ),
+        "keys": sorted(str(key) for key in item.keys()),
+    }
 
 
 def _validate_against_response_schema(payload: dict[str, Any]) -> None:
@@ -375,28 +481,59 @@ def _payload_from_model_json(parsed: Any, image_size: tuple[int, int]) -> dict[s
 def _payload_from_er_box_array(items: list[Any], image_size: tuple[int, int]) -> dict[str, Any]:
     labels: list[dict[str, Any]] = []
     for item in items:
-        if not isinstance(item, dict):
-            continue
-        text = str(item.get("label", item.get("text", ""))).strip()
-        value = _coerce_float(item.get("value"))
-        if value is None:
-            value = _numeric_value_from_text(text)
-        box = item.get("box_2d", item.get("bbox"))
-        if value is None or not _is_bbox(box):
-            continue
-        labels.append(
-            {
-                "text": text or str(value),
-                "value": value,
-                "bbox": _er_box_to_pixel_bbox([float(part) for part in box], image_size),
-                "confidence": _clamp01(
-                    _coerce_float(item.get("confidence"))
-                    if _coerce_float(item.get("confidence")) is not None
-                    else 0.75
-                ),
-            }
-        )
+        label = _label_from_er_item(item, image_size)
+        if label is not None:
+            labels.append(label)
     return {"unit": None, "labels": labels}
+
+
+def _label_from_er_item(item: Any, image_size: tuple[int, int]) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    text = str(_first_present(item, ("label", "text", "number", "value", "name")) or "").strip()
+    value = _coerce_float(_first_present(item, ("value", "number")))
+    if value is None:
+        value = _numeric_value_from_text(text)
+    if value is None:
+        return None
+
+    box = _first_present(
+        item,
+        (
+            "box_2d",
+            "bbox",
+            "bounding_box",
+            "boundingBox",
+            "box",
+            "box2d",
+        ),
+    )
+    center = _first_present(
+        item,
+        (
+            "center_point",
+            "center",
+            "point",
+            "location",
+        ),
+    )
+    if not _is_bbox(box) and not _is_point(center):
+        return None
+
+    label: dict[str, Any] = {
+        "text": text or str(value),
+        "value": value,
+        "confidence": _clamp01(
+            _coerce_float(item.get("confidence"))
+            if _coerce_float(item.get("confidence")) is not None
+            else 0.75
+        ),
+    }
+    if _is_bbox(box):
+        label["bbox"] = _er_box_to_pixel_bbox([float(part) for part in box], image_size)
+    if _is_point(center):
+        label["center"] = _er_point_to_pixel_point(center, image_size)
+    return label
 
 
 def _payload_from_er_object(payload: dict[str, Any], image_size: tuple[int, int]) -> dict[str, Any]:
@@ -542,16 +679,21 @@ def _normalize_label(raw: Any) -> dict[str, Any] | None:
         return None
     value = _coerce_float(raw.get("value"))
     bbox = raw.get("bbox")
-    if value is None or not _is_bbox(bbox):
+    center = raw.get("center")
+    if value is None or (not _is_bbox(bbox) and not _is_point(center)):
         return None
     text = str(raw.get("text", value)).strip()
     confidence = _coerce_float(raw.get("confidence"))
-    return {
+    label: dict[str, Any] = {
         "text": text,
         "value": value,
-        "bbox": [float(item) for item in bbox],
         "confidence": _clamp01(confidence if confidence is not None else 0.75),
     }
+    if _is_bbox(bbox):
+        label["bbox"] = [float(item) for item in bbox]
+    if _is_point(center):
+        label["center"] = [float(item) for item in center]
+    return label
 
 
 def _normalize_dial(raw: Any) -> dict[str, Any] | None:
@@ -600,6 +742,13 @@ def _guess_mime_type(image_path: Path) -> str:
     if image_path.suffix.lower() == ".avif":
         return "image/avif"
     return "image/jpeg"
+
+
+def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 def _coerce_float(value: Any) -> float | None:

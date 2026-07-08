@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gauge-label-lab"
+version = "0.1.0"
+description = "Small web labelling tool for gauge image readings."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "Relay" }]
+license = { text = "MIT" }
+dependencies = []
+
+[project.scripts]
+gauge-label-lab = "gauge_label_lab.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

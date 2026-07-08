@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from gauge_reader.cloud import CloudVisionAdapter, VisionExtraction, extraction_from_mapping
+from gauge_reader.cloud import (
+    CommandCloudVisionAdapter,
+    CloudVisionAdapter,
+    GeminiCloudVisionAdapter,
+    VisionExtraction,
+    extraction_from_mapping,
+)
+from gauge_reader.cv_pipeline import MissingDependencyError
 from gauge_reader.geometry import point_on_dial
 from gauge_reader.models import (
     BBox,
@@ -32,6 +41,11 @@ class FakePipeline:
         return self.observation
 
 
+class MissingDependencyPipeline:
+    def process(self, image_path: str) -> GaugeObservation:
+        raise MissingDependencyError("cv2 unavailable")
+
+
 class FakeCloud(CloudVisionAdapter):
     def __init__(self, extraction: VisionExtraction):
         self.extraction = extraction
@@ -43,6 +57,34 @@ class FakeCloud(CloudVisionAdapter):
 
 
 class ReaderTests(unittest.TestCase):
+    def test_force_cloud_ocr_defaults_to_gemini_adapter_without_command_env(self) -> None:
+        with patch.dict("os.environ", {"GAUGE_READER_CLOUD_COMMAND": ""}):
+            reader = GaugeReader(
+                pipeline=FakePipeline(GaugeObservation(dial=None, needle=None)),
+                force_cloud_ocr=True,
+            )
+
+        self.assertIsInstance(reader.cloud_adapter, GeminiCloudVisionAdapter)
+
+    def test_gemini_adapter_marks_extractions_as_cloud_source(self) -> None:
+        adapter = GeminiCloudVisionAdapter()
+        with patch(
+            "gauge_reader.gemini_vlm_adapter.extract_gauge_labels",
+            return_value={
+                "unit": None,
+                "labels": [
+                    {"text": "5", "value": 5, "center": [10, 20], "confidence": 0.9},
+                ],
+                "dial": None,
+                "needle": None,
+                "ticks": [],
+            },
+        ):
+            extraction = adapter.extract("unused.jpg")
+
+        self.assertEqual(len(extraction.labels), 1)
+        self.assertEqual(extraction.labels[0].source, "cloud_gemini")
+
     def test_manual_calibration_overrides_missing_ocr(self) -> None:
         observation = GaugeObservation(
             dial=DialGeometry(Point(100, 100), 80, confidence=0.9),
@@ -117,6 +159,150 @@ class ReaderTests(unittest.TestCase):
         self.assertAlmostEqual(result.reading or 0, 50.0, places=1)
         self.assertEqual(result.reason, "ok_cloud_fallback")
 
+    def test_force_cloud_ocr_calls_cloud_even_when_local_ocr_is_sufficient(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        observation = GaugeObservation(
+            dial=dial,
+            needle=NeedleDetection(angle=90, confidence=0.95),
+            ticks=[
+                TickDetection(angle=225, confidence=0.8),
+                TickDetection(angle=90, confidence=0.8),
+                TickDetection(angle=315, confidence=0.8),
+            ],
+            labels=[
+                NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="local_tesseract"),
+                NumericLabel(value=10, text="10", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="local_tesseract"),
+                NumericLabel(value=100, text="100", center=point_on_dial(dial, 315, 0.72), confidence=0.9, source="local_tesseract"),
+            ],
+        )
+        cloud = FakeCloud(
+            VisionExtraction(
+                labels=[
+                    NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=50, text="50", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=100, text="100", center=point_on_dial(dial, 315, 0.72), confidence=0.9, source="cloud"),
+                ]
+            )
+        )
+        reader = GaugeReader(
+            pipeline=FakePipeline(observation),
+            cloud_adapter=cloud,
+            use_cloud=True,
+            force_cloud_ocr=True,
+        )
+
+        result = reader.read("unused.jpg")
+
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.reading or 0, 50.0, places=1)
+        self.assertEqual(result.reason, "ok_cloud_ocr")
+        assert result.lower_tick is not None
+        self.assertEqual(result.lower_tick.source, "cloud")
+
+    def test_force_cloud_ocr_calls_cloud_even_with_manual_calibration(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        observation = GaugeObservation(
+            dial=dial,
+            needle=NeedleDetection(angle=90, confidence=0.95),
+        )
+        cloud = FakeCloud(VisionExtraction())
+        reader = GaugeReader(
+            pipeline=FakePipeline(observation),
+            cloud_adapter=cloud,
+            force_cloud_ocr=True,
+        )
+
+        result = reader.read(
+            "unused.jpg",
+            calibration={
+                "ticks": [
+                    {"value": 0, "angle": 225},
+                    {"value": 100, "angle": 315},
+                ],
+            },
+        )
+
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.reading or 0, 50.0)
+
+    def test_force_cloud_ocr_drops_local_labels_when_cloud_returns_none(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        observation = GaugeObservation(
+            dial=dial,
+            needle=NeedleDetection(angle=90, confidence=0.95),
+            ticks=[
+                TickDetection(angle=225, confidence=0.8),
+                TickDetection(angle=90, confidence=0.8),
+            ],
+            labels=[
+                NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="local_tesseract"),
+                NumericLabel(value=50, text="50", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="local_tesseract"),
+            ],
+        )
+        cloud = FakeCloud(VisionExtraction())
+        reader = GaugeReader(
+            pipeline=FakePipeline(observation),
+            cloud_adapter=cloud,
+            use_cloud=True,
+            force_cloud_ocr=True,
+        )
+
+        result = reader.read("unused.jpg")
+
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.reason, "not_enough_known_ticks")
+        self.assertIsNone(result.reading)
+
+    def test_cloud_fallback_uses_label_angles_when_local_ticks_are_bad(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        observation = GaugeObservation(
+            dial=dial,
+            needle=NeedleDetection(angle=90, confidence=0.95),
+            ticks=[TickDetection(angle=10, confidence=0.7)],
+        )
+        cloud = FakeCloud(
+            VisionExtraction(
+                labels=[
+                    NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=50, text="50", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=100, text="100", center=point_on_dial(dial, 315, 0.72), confidence=0.9, source="cloud"),
+                ]
+            )
+        )
+        reader = GaugeReader(pipeline=FakePipeline(observation), cloud_adapter=cloud, use_cloud=True)
+
+        result = reader.read("unused.jpg")
+
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.reading or 0, 50.0, places=1)
+        self.assertEqual(result.reason, "ok_cloud_fallback")
+
+    def test_cloud_only_fallback_runs_when_local_cv_dependencies_are_missing(self) -> None:
+        dial = DialGeometry(Point(100, 100), 80, confidence=0.9)
+        cloud = FakeCloud(
+            VisionExtraction(
+                dial=dial,
+                needle=NeedleDetection(angle=90, confidence=0.95, start=dial.center, end=point_on_dial(dial, 90, 0.9), source="cloud"),
+                labels=[
+                    NumericLabel(value=0, text="0", center=point_on_dial(dial, 225, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=50, text="50", center=point_on_dial(dial, 90, 0.72), confidence=0.9, source="cloud"),
+                    NumericLabel(value=100, text="100", center=point_on_dial(dial, 315, 0.72), confidence=0.9, source="cloud"),
+                ],
+            )
+        )
+        reader = GaugeReader(pipeline=MissingDependencyPipeline(), cloud_adapter=cloud, use_cloud=True)
+
+        result = reader.read("unused.jpg")
+
+        self.assertEqual(cloud.calls, 1)
+        self.assertEqual(result.status, "ok")
+        self.assertAlmostEqual(result.reading or 0, 50.0, places=1)
+        self.assertEqual(result.reason, "ok_cloud_fallback")
+
     def test_cloud_fallback_can_supply_missing_needle_with_calibration(self) -> None:
         observation = GaugeObservation(
             dial=DialGeometry(Point(100, 100), 80, confidence=0.9),
@@ -171,6 +357,38 @@ class ReaderTests(unittest.TestCase):
         assert extraction.needle is not None
         self.assertAlmostEqual(extraction.dial.radius, 80)
         self.assertAlmostEqual(extraction.needle.angle, 90)
+
+    def test_command_cloud_adapter_replaces_image_literal_and_parses_wrapped_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script = Path(tmpdir) / "cloud_adapter.py"
+            script.write_text(
+                "import json\n"
+                "print('adapter banner')\n"
+                "print(json.dumps({'labels': [{'text': '5', 'value': 5, 'center': [10, 20]}]}))\n",
+                encoding="utf-8",
+            )
+            adapter = CommandCloudVisionAdapter(f"{sys.executable} {script} {{image}}")
+
+            extraction = adapter.extract("unused image.jpg")
+
+        self.assertEqual(len(extraction.labels), 1)
+        self.assertEqual(extraction.labels[0].value, 5.0)
+        assert extraction.labels[0].center is not None
+        self.assertEqual(extraction.labels[0].center.to_tuple(), (10.0, 20.0))
+
+    def test_cloud_mapping_accepts_center_point_alias_for_labels(self) -> None:
+        extraction = extraction_from_mapping(
+            {
+                "labels": [
+                    {"text": "5", "value": 5, "center_point": [10, 20]},
+                ],
+            },
+            source="test",
+        )
+
+        self.assertEqual(len(extraction.labels), 1)
+        assert extraction.labels[0].center is not None
+        self.assertEqual(extraction.labels[0].center.to_tuple(), (10.0, 20.0))
 
     def test_filters_labels_outside_dial_ring(self) -> None:
         dial = DialGeometry(Point(100, 100), 80, confidence=0.9)

@@ -15,7 +15,8 @@ from .geometry import (
     normalize_angle,
     point_on_dial,
 )
-from .models import DialGeometry, GaugeObservation, NeedleDetection, Point, TickDetection
+from .cropping import dial_crop_box, translate_numeric_labels
+from .models import BBox, DialGeometry, GaugeObservation, NeedleDetection, NumericLabel, Point, TickDetection
 from .ocr import detect_labels_with_tesseract
 
 
@@ -40,7 +41,7 @@ class LocalCVPipeline:
         dial = self._estimate_dial(cv2, np, gray, edges)
         needle = self._detect_needle(cv2, np, gray, edges, dial)
         ticks = self._detect_ticks(cv2, np, edges, dial)
-        labels = detect_labels_with_tesseract(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        labels = self._detect_labels(cv2, image, dial)
         return GaugeObservation(
             dial=dial,
             needle=needle,
@@ -124,7 +125,15 @@ class LocalCVPipeline:
 
         output = debug_path / "overlay.jpg"
         cv2.imwrite(str(output), image)
-        return {"overlay": str(output)}
+        debug = {"overlay": str(output)}
+        if observation.dial is not None:
+            crop = self._crop_image_to_dial(image, observation.dial)
+            if crop is not None:
+                crop_image, _ = crop
+                crop_output = debug_path / "ocr_crop.jpg"
+                cv2.imwrite(str(crop_output), crop_image)
+                debug["ocr_crop"] = str(crop_output)
+        return debug
 
     def _estimate_dial(self, cv2: Any, np: Any, gray: Any, edges: Any) -> DialGeometry:
         height, width = gray.shape[:2]
@@ -367,6 +376,27 @@ class LocalCVPipeline:
                 )
             )
         return merge_ticks_by_angle(ticks, tolerance_degrees=2.5)
+
+    def _detect_labels(self, cv2: Any, image: Any, dial: DialGeometry | None) -> list[NumericLabel]:
+        crop = self._crop_image_to_dial(image, dial)
+        if crop is None:
+            return detect_labels_with_tesseract(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        crop_image, crop_box = crop
+        crop_labels = detect_labels_with_tesseract(cv2.cvtColor(crop_image, cv2.COLOR_BGR2RGB))
+        return translate_numeric_labels(crop_labels, Point(crop_box.x, crop_box.y))
+
+    def _crop_image_to_dial(self, image: Any, dial: DialGeometry | None) -> tuple[Any, BBox] | None:
+        height, width = image.shape[:2]
+        crop_box = dial_crop_box(dial, width, height)
+        if crop_box is None:
+            return None
+        x0 = int(crop_box.x)
+        y0 = int(crop_box.y)
+        x1 = int(crop_box.x + crop_box.width)
+        y1 = int(crop_box.y + crop_box.height)
+        if x1 <= x0 or y1 <= y0:
+            return None
+        return image[y0:y1, x0:x1], crop_box
 
 
 def _import_cv() -> tuple[Any, Any]:

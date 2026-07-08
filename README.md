@@ -11,6 +11,8 @@ This project reads single-needle radial analogue gauges by localizing the needle
 
 For camera-perspective distortion, the local CV path first tries to fit the dial boundary as an ellipse. Tick, label, and needle angles are then measured in ellipse-normalized dial space, and the effective needle pivot is refined from the convergence of radial tick/needle-like line segments when enough candidates are visible. This is more stable than assuming the photographed gauge is a centered circle.
 
+After estimating the dial, OCR runs on a padded crop around the dial instead of the full image. Cloud OCR/VLM calls also receive this crop when a dial was found, and all returned coordinates are translated back into the original image before interpolation and debug overlays.
+
 ## Install
 
 Core geometry and tests use only the Python standard library. For real image reading, install the CV extras:
@@ -30,6 +32,8 @@ python3 -m pip install -e ".[cloud]"
 ```bash
 gauge-read path/to/gauge.jpg --debug out/
 ```
+
+When debug output is enabled, `ocr_crop.jpg` shows the cropped dial image used for OCR.
 
 The CLI prints JSON:
 
@@ -72,14 +76,29 @@ Point-based calibration is converted to an angle using the detected dial center.
 
 ## Cloud Fallback
 
-The cloud integration is command-based. The built-in Gemini adapter can be used like this:
+Install the cloud extra and set a Gemini API key:
 
 ```bash
 python3 -m pip install -e ".[cloud]"
 export GEMINI_API_KEY='your-api-key'
-export GAUGE_READER_CLOUD_COMMAND='gauge-vlm-gemini "{image}"'
-gauge-read gauge.jpg --debug out/
 ```
+
+To force numeric label OCR through the built-in Gemini Robotics-ER adapter even when local OCR produces labels, add:
+
+```bash
+gauge-read gauge.jpg --debug out/ --force-cloud-ocr
+```
+
+This still uses local CV for dial, needle, and tick geometry when available. Manual calibration ticks override OCR for interpolation, but `--force-cloud-ocr` still calls the cloud adapter so you can inspect Gemini output in debug/eval runs.
+
+When cloud OCR appears to miss boxes, dump the raw Gemini response and parser counts:
+
+```bash
+export GAUGE_READER_GEMINI_DIAGNOSTICS='out/gemini_diagnostics.json'
+gauge-read gauge.jpg --debug out/ --force-cloud-ocr
+```
+
+If `raw_labels` is greater than `converted_labels`, Gemini found labels but the response shape did not include usable geometry for every label.
 
 You can choose a model with:
 
@@ -107,7 +126,7 @@ Expected output:
 }
 ```
 
-You can also provide your own command by setting `GAUGE_READER_CLOUD_COMMAND` to any executable that prints the same JSON shape. If `GAUGE_READER_CLOUD_COMMAND` is unset, the reader stays local.
+You can also provide your own command by setting `GAUGE_READER_CLOUD_COMMAND` to any executable that prints the same JSON shape. The command adapter takes precedence over the built-in Gemini adapter.
 
 ## Python API
 
@@ -119,6 +138,60 @@ result = reader.read("gauge.jpg", calibration=None, debug_dir="out")
 print(result.to_dict())
 ```
 
+To force cloud OCR labels from Python:
+
+```python
+reader = GaugeReader(force_cloud_ocr=True)
+```
+
+## Dataset Evaluation
+
+From the repo root, evaluate a folder of same-stem `.png`/`.json` pairs whose JSON contains `synth_dial_value`:
+
+```bash
+python3 evaluate_dataset.py /Users/nayan.patel/Downloads/archive/sample_synth_datasets/ds6.0/data --output eval_runs/ds6_zero_shot --no-cloud
+```
+
+If your global `python3` does not have the CV extras installed, use the repo venv:
+
+```bash
+.venv/bin/python evaluate_dataset.py /Users/nayan.patel/Downloads/archive/sample_synth_datasets/ds6.0/data --output eval_runs/ds6_zero_shot --no-cloud
+```
+
+The evaluator writes `summary.json`, `per_sample_results.csv`, and per-sample model-view overlays under `OUTPUT/labeled/<sample_id>/overlay.jpg`. Source dataset images remain in their original folder. To isolate needle/dial geometry from OCR quality, use the synthetic `scale-label` annotations as calibration ticks:
+
+While running from the CLI, progress is printed to stderr as `completed/total` after each sample. Add `--no-progress` to silence it.
+
+For cross-gauge comparisons, the evaluator also reports range-normalized error when the JSON contains at least two `scale-label`/`tick-label` `synth_value`s. `percent_range_error` is `abs(prediction - target) / (gauge_max - gauge_min) * 100`, which is usually more comparable than raw-unit error across gauges with different scales.
+
+```bash
+python3 evaluate_dataset.py /Users/nayan.patel/Downloads/archive/sample_synth_datasets/ds6.0/data --output eval_runs/ds6_oracle --no-cloud --oracle-calibration
+```
+
+To benchmark the cloud OCR path directly, include `--force-cloud-ocr` and leave cloud enabled:
+
+```bash
+.venv/bin/python evaluate_dataset.py /Users/nayan.patel/Downloads/archive/sample_synth_datasets/ds6.0/data --output eval_runs/ds6_cloud_ocr --force-cloud-ocr
+```
+
+Equivalent named eval pipeline:
+
+```bash
+.venv/bin/python evaluate_dataset.py /Users/nayan.patel/Downloads/archive/sample_synth_datasets/ds6.0/data --output eval_runs/ds6_cloud_ocr --pipeline cloud-ocr
+```
+
 ## Current Scope
 
 V1 targets single-needle radial gauges with visible numeric markings. Multi-needle gauges, rectangular/linear gauges, and digital sub-displays are intentionally out of scope.
+
+## Gauge Label Lab
+
+From the repo root, run the web labelling tool without installing the separate package:
+
+```bash
+python3 label_lab.py --input imgs --labeled labeled_gauge_images --csv gauge_labels.csv
+```
+
+Then open `http://127.0.0.1:8765`.
+
+When a label is saved, the original image stays in the input folder. The labeled folder receives a separate `*_overlay` image generated from the gauge reader debug view, and the CSV row points `labeled_path` at that overlay.
